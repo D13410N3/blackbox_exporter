@@ -41,6 +41,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/prometheus/blackbox_exporter/config"
+	"github.com/prometheus/blackbox_exporter/logger"
 	"github.com/prometheus/blackbox_exporter/prober"
 )
 
@@ -74,46 +75,53 @@ func run() int {
 	kingpin.CommandLine.UsageWriter(os.Stdout)
 	promslogConfig := &promslog.Config{}
 	flag.AddFlags(kingpin.CommandLine, promslogConfig)
+
+	// Initialize our custom logger config
+	loggerConfig := logger.NewConfig(promslogConfig)
+	logger.AddFlags(kingpin.CommandLine, loggerConfig)
+
 	kingpin.Version(version.Print("blackbox_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
-	logger := promslog.New(promslogConfig)
+
+	// Create logger with the configured format
+	log := logger.New(loggerConfig)
 	rh := &prober.ResultHistory{MaxResults: *historyLimit}
 
 	probeLogLevel := promslog.NewLevel()
 	if err := probeLogLevel.Set(*logLevelProber); err != nil {
-		logger.Warn("Error setting log prober level, log prober level unchanged", "err", err, "current_level", probeLogLevel.String())
+		log.Warn("Error setting log prober level, log prober level unchanged", "err", err, "current_level", probeLogLevel.String())
 	}
 
-	logger.Info("Starting blackbox_exporter", "version", version.Info())
-	logger.Info(version.BuildContext())
+	log.Info("Starting blackbox_exporter", "version", version.Info())
+	log.Info(version.BuildContext())
 
-	if err := sc.ReloadConfig(*configFile, logger); err != nil {
-		logger.Error("Error loading config", "err", err)
+	if err := sc.ReloadConfig(*configFile, log); err != nil {
+		log.Error("Error loading config", "err", err)
 		return 1
 	}
 
 	if *configCheck {
-		logger.Info("Config file is ok exiting...")
+		log.Info("Config file is ok exiting...")
 		return 0
 	}
 
-	logger.Info("Loaded config file")
+	log.Info("Loaded config file")
 
 	// Infer or set Blackbox exporter externalURL
 	listenAddrs := toolkitFlags.WebListenAddresses
 	if *externalURL == "" && *toolkitFlags.WebSystemdSocket {
-		logger.Error("Cannot automatically infer external URL with systemd socket listener. Please provide --web.external-url")
+		log.Error("Cannot automatically infer external URL with systemd socket listener. Please provide --web.external-url")
 		return 1
 	} else if *externalURL == "" && len(*listenAddrs) > 1 {
-		logger.Info("Inferring external URL from first provided listen address")
+		log.Info("Inferring external URL from first provided listen address")
 	}
 	beURL, err := computeExternalURL(*externalURL, (*listenAddrs)[0])
 	if err != nil {
-		logger.Error("failed to determine external URL", "err", err)
+		log.Error("failed to determine external URL", "err", err)
 		return 1
 	}
-	logger.Debug(beURL.String())
+	log.Debug(beURL.String())
 
 	// Default -web.route-prefix to path of -web.external-url.
 	if *routePrefix == "" {
@@ -127,7 +135,7 @@ func run() int {
 	if *routePrefix != "/" {
 		*routePrefix = *routePrefix + "/"
 	}
-	logger.Debug(*routePrefix)
+	log.Debug(*routePrefix)
 
 	hup := make(chan os.Signal, 1)
 	reloadCh := make(chan chan error)
@@ -136,17 +144,17 @@ func run() int {
 		for {
 			select {
 			case <-hup:
-				if err := sc.ReloadConfig(*configFile, logger); err != nil {
-					logger.Error("Error reloading config", "err", err)
+				if err := sc.ReloadConfig(*configFile, log); err != nil {
+					log.Error("Error reloading config", "err", err)
 					continue
 				}
-				logger.Info("Reloaded config file")
+				log.Info("Reloaded config file")
 			case rc := <-reloadCh:
-				if err := sc.ReloadConfig(*configFile, logger); err != nil {
-					logger.Error("Error reloading config", "err", err)
+				if err := sc.ReloadConfig(*configFile, log); err != nil {
+					log.Error("Error reloading config", "err", err)
 					rc <- err
 				} else {
-					logger.Info("Reloaded config file")
+					log.Info("Reloaded config file")
 					rc <- nil
 				}
 			}
@@ -188,7 +196,7 @@ func run() int {
 		sc.Lock()
 		conf := sc.C
 		sc.Unlock()
-		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, promslogConfig.Level, probeLogLevel)
+		prober.Handler(w, r, conf, log, rh, *timeoutOffset, nil, moduleUnknownCounter, promslogConfig.Level, probeLogLevel)
 	})
 	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -257,7 +265,7 @@ func run() int {
 		c, err := yaml.Marshal(sc.C)
 		sc.RUnlock()
 		if err != nil {
-			logger.Warn("Error marshalling configuration", "err", err)
+			log.Warn("Error marshalling configuration", "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -271,8 +279,8 @@ func run() int {
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		if err := web.ListenAndServe(srv, toolkitFlags, logger); err != nil {
-			logger.Error("Error starting HTTP server", "err", err)
+		if err := web.ListenAndServe(srv, toolkitFlags, log); err != nil {
+			log.Error("Error starting HTTP server", "err", err)
 			close(srvc)
 		}
 	}()
@@ -280,7 +288,7 @@ func run() int {
 	for {
 		select {
 		case <-term:
-			logger.Info("Received SIGTERM, exiting gracefully...")
+			log.Info("Received SIGTERM, exiting gracefully...")
 			return 0
 		case <-srvc:
 			return 1

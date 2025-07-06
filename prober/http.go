@@ -17,7 +17,9 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -289,6 +291,18 @@ func (bc *byteCounter) Read(p []byte) (int, error) {
 var userAgentDefaultHeader = fmt.Sprintf("Blackbox Exporter/%s", version.Version)
 
 func ProbeHTTP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (success bool) {
+	// Register the HTTP hashsum metric if it exists
+	httpHashsum := config.HTTPHashsum
+	if httpHashsum != nil {
+		registry.MustRegister(httpHashsum)
+	}
+
+	// Get module name
+	moduleName := module.Prober
+	if moduleName == "" {
+		moduleName = "http_2xx"
+	}
+
 	var redirects int
 	var (
 		durationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -620,13 +634,30 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		}
 
 		if !requestErrored {
-			_, err = io.Copy(io.Discard, byteCounter)
+			// Read the body into a buffer
+			body, err := io.ReadAll(byteCounter)
 			if err != nil {
 				logger.Info("Failed to read HTTP response body", "err", err)
 				success = false
-			}
+			} else {
+				respBodyBytes = int64(len(body))
 
-			respBodyBytes = byteCounter.n
+				// Calculate and report hashsum if enabled
+				if httpConfig.ReportHashsum && httpHashsum != nil {
+					h := md5.New()
+					h.Write(body)
+					hash := hex.EncodeToString(h.Sum(nil))
+
+					// Convert hash to float64 for prometheus gauge
+					var hashFloat float64
+					for _, c := range hash {
+						hashFloat = hashFloat*16 + float64(c-'0')
+					}
+
+					httpHashsum.WithLabelValues(target, moduleName).Set(hashFloat)
+					logger.Info("Calculated HTTP response body hash", "hash", hash)
+				}
+			}
 
 			if err := byteCounter.Close(); err != nil {
 				// We have already read everything we could from the server, maybe even uncompressed the

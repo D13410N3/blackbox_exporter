@@ -39,6 +39,17 @@ import (
 )
 
 var (
+	// HTTPHashsum is a metric that exposes the MD5 hash of the HTTP response body when report_hashsum is enabled
+	HTTPHashsum = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "blackbox_exporter",
+			Name:      "http_hashsum",
+			Help:      "MD5 hash of the HTTP response body",
+		},
+		[]string{"target", "module"},
+	)
+
+	// DefaultModule set default configuration for the Module
 	// DefaultModule set default configuration for the Module
 	DefaultModule = Module{
 		HTTP: DefaultHTTPProbe,
@@ -291,6 +302,7 @@ type HTTPProbe struct {
 	HTTPClientConfig             config.HTTPClientConfig `yaml:"http_client_config,inline"`
 	Compression                  string                  `yaml:"compression,omitempty"`
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty"`
+	ReportHashsum                bool                    `yaml:"report_hashsum,omitempty"`
 }
 
 type GRPCProbe struct {

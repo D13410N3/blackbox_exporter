@@ -1,3 +1,10 @@
+# This is a fork
+
+## Changes made
+* `--log.output-format=json` return logs in JSON format `{"message":"", "severity":""}`
+* Log probe result
+* Added `module.http.report_hashsum` to report metric `blackbox_exporter_http_hashsum` with hash of HTTP response body
+
 # Blackbox exporter
 
 [![CircleCI](https://circleci.com/gh/prometheus/blackbox_exporter/tree/master.svg?style=shield)][circleci]

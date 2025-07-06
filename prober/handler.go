@@ -14,6 +14,7 @@
 package prober
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -21,7 +22,9 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/blackbox_exporter/config"
@@ -109,9 +112,12 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 		}
 	}
 
-	sl := newScrapeLogger(logger, moduleName, target, logLevel, logLevelProber)
-	slLogger := slog.New(sl)
+	// Create a buffer to capture all logs for failure analysis
+	var logBuffer bytes.Buffer
+	bufferLogger := promslog.New(&promslog.Config{Writer: &logBuffer, Level: logLevel})
+	slLogger := bufferLogger.With("module", moduleName, "target", target)
 
+	// Don't log the beginning of the probe to the main logger
 	slLogger.Info("Beginning probe", "probe", module.Prober, "timeout_seconds", timeoutSeconds)
 
 	start := time.Now()
@@ -121,14 +127,26 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	success := prober(ctx, target, module, registry, slLogger)
 	duration := time.Since(start).Seconds()
 	probeDurationGauge.Set(duration)
+
+	// Only log the final result
 	if success {
 		probeSuccessGauge.Set(1)
-		slLogger.Info("Probe succeeded", "duration_seconds", duration)
+		// For successful probes, only log the final result without intermediate steps
+		logger.Info(fmt.Sprintf("Probe %s using module %s was successful", target, moduleName))
 	} else {
-		slLogger.Error("Probe failed", "duration_seconds", duration)
+		// For failed probes, extract the failure reason and log it
+		reason := extractFailureReason(&logBuffer)
+		var resultMsg string
+		if reason != "" {
+			resultMsg = fmt.Sprintf("Probe %s using module %s failed with reason: %s", target, moduleName, reason)
+		} else {
+			resultMsg = fmt.Sprintf("Probe %s using module %s failed", target, moduleName)
+		}
+		// Log the result in the specified JSON format
+		logger.Info(resultMsg)
 	}
 
-	debugOutput := DebugOutput(&module, &sl.buffer, registry)
+	debugOutput := DebugOutput(&module, &logBuffer, registry)
 	rh.Add(moduleName, target, debugOutput, success)
 
 	if r.URL.Query().Get("debug") == "true" {
@@ -163,17 +181,6 @@ type scrapeLogger struct {
 	buffer         bytes.Buffer
 	bufferLogger   *slog.Logger
 	logLevelProber *promslog.Level
-}
-
-// Enabled returns true if both A) the scrapeLogger's internal `next` logger
-// and B) the scrapeLogger's internal `bufferLogger` are enabled at the
-// provided context/log level, and returns false otherwise. It implements
-// slog.Handler.
-func (sl *scrapeLogger) Enabled(ctx context.Context, level slog.Level) bool {
-	nextEnabled := sl.next.Enabled(ctx, level)
-	bufEnabled := sl.bufferLogger.Enabled(ctx, level)
-
-	return nextEnabled && bufEnabled
 }
 
 // Handle writes the provided log record to the internal logger, and then to
@@ -217,6 +224,12 @@ func (sl *scrapeLogger) WithGroup(name string) slog.Handler {
 		bufferLogger:   slog.New(sl.bufferLogger.Handler().WithGroup(name)),
 		logLevelProber: sl.logLevelProber,
 	}
+}
+
+// Enabled implements slog.Handler.
+func (sl *scrapeLogger) Enabled(ctx context.Context, level slog.Level) bool {
+	// We want to capture all logs for potential failure analysis
+	return true
 }
 
 func newScrapeLogger(logger *slog.Logger, module string, target string, logLevel, logLevelProber *promslog.Level) *scrapeLogger {
@@ -269,6 +282,114 @@ func DebugOutput(module *config.Module, logBuffer *bytes.Buffer, registry *prome
 	buf.Write(c)
 
 	return buf.String()
+}
+
+// extractFailureReason attempts to extract a meaningful failure reason from the log buffer
+func extractFailureReason(buffer *bytes.Buffer) string {
+	// Make a copy of the buffer to avoid modifying the original
+	bufferCopy := bytes.NewBuffer(buffer.Bytes())
+
+	// First, look for HTTP status code issues which are common
+	scanner := bufio.NewScanner(bufferCopy)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Check for HTTP status code issues
+		if strings.Contains(line, "Invalid HTTP response status code") {
+			// Extract status code from the line
+			statusCodeMatch := regexp.MustCompile(`status_code=([0-9]+)`).FindStringSubmatch(line)
+			if len(statusCodeMatch) > 1 {
+				return fmt.Sprintf("expected HTTP status 2xx but got %s", statusCodeMatch[1])
+			}
+
+			// Fallback if we can't extract the status code
+			return "expected HTTP status 2xx but got a different status code"
+		}
+
+		// Check for DNS resolution errors
+		if strings.Contains(line, "Error resolving address") {
+			// Try to extract the specific error
+			errMatch := regexp.MustCompile(`err="([^"]+)"`).FindStringSubmatch(line)
+			if len(errMatch) > 1 {
+				return errMatch[1]
+			}
+			return "DNS resolution failed"
+		}
+
+		// Look for HTTP redirects
+		if strings.Contains(line, "following redirects") && strings.Contains(line, "got 302") {
+			return "received HTTP 302 redirect when expecting direct response"
+		}
+	}
+
+	// Reset buffer for next scan
+	bufferCopy = bytes.NewBuffer(buffer.Bytes())
+
+	// Look for specific error patterns in the logs
+	specificErrors := []struct {
+		pattern string
+		message string
+	}{
+		{"connection refused", "connection refused"},
+		{"timeout", "connection timed out"},
+		{"context deadline exceeded", "request timed out"},
+		{"no such host", "DNS resolution failed: no such host"},
+		{"TLS handshake error", "TLS handshake failed"},
+		{"certificate has expired", "SSL certificate has expired"},
+		{"certificate is not valid", "SSL certificate is not valid"},
+		{"x509: certificate", "SSL certificate validation error"},
+		{"connection reset by peer", "connection reset by peer"},
+		{"no route to host", "no route to host"},
+		{"dial tcp", "TCP connection failed"},
+		{"lookup failed", "DNS lookup failed"},
+	}
+
+	// Scan for specific error patterns
+	scanner = bufio.NewScanner(bufferCopy)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Check for specific error messages
+		for _, errDef := range specificErrors {
+			if strings.Contains(line, errDef.pattern) {
+				return errDef.message
+			}
+		}
+	}
+
+	// If no specific reason found, do a more general search
+	bufferCopy = bytes.NewBuffer(buffer.Bytes())
+	scanner = bufio.NewScanner(bufferCopy)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Look for any error messages
+		if strings.Contains(line, "error") || strings.Contains(line, "Error") || strings.Contains(line, "ERROR") ||
+			strings.Contains(line, "failed") || strings.Contains(line, "Failed") || strings.Contains(line, "FAILED") {
+			// Try to extract the msg field from the log line
+			msgMatch := regexp.MustCompile(`msg="([^"]+)"`).FindStringSubmatch(line)
+			if len(msgMatch) > 1 {
+				return msgMatch[1]
+			}
+
+			// Extract the message part from JSON format
+			messageParts := strings.SplitN(line, "\"message\":", 2)
+			if len(messageParts) > 1 {
+				// Extract the message part
+				message := messageParts[1]
+				// Remove quotes and other JSON parts
+				message = strings.TrimPrefix(message, "\"")
+				endIndex := strings.Index(message, "\",")
+				if endIndex > 0 {
+					message = message[:endIndex]
+				}
+				return message
+			}
+		}
+	}
+
+	// If no specific reason found, return empty string
+	return ""
 }
 
 func getTimeout(r *http.Request, module config.Module, offset float64) (timeoutSeconds float64, err error) {
